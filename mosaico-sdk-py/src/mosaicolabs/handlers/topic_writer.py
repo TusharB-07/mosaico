@@ -35,7 +35,10 @@ class TopicWriter:
     The `TopicWriter` abstracts the complexity of the PyArrow Flight `DoPut` protocol,
     handling internal buffering, serialization, and network transmission.
     It accumulates records in memory and automatically flushes them to the server
-    once the buffered size approaches the server's message-size limit.
+    once the buffered size approaches the server's message-size limit. The same
+    applies to the batches pushed in Arrow format through
+    [`push_batch()`][mosaicolabs.handlers.TopicWriter.push_batch], which are split
+    or merged to stay within the limit.
 
     Note:
         A single record whose size alone exceeds that limit cannot be split any
@@ -382,7 +385,7 @@ class TopicWriter:
 
     def push_batch(self, timestamp_ns: pa.Array, data: pa.RecordBatch) -> None:
         """
-        Sends a whole batch of records to the server in a single transmission.
+        Buffers a whole batch of records, to be sent merged with the other batches.
 
         This is the columnar counterpart of [`push()`][mosaicolabs.handlers.TopicWriter.push],
         meant for data that is already in Arrow format (e.g. read from Parquet files): the
@@ -392,12 +395,21 @@ class TopicWriter:
         topic's ontology, while the `timestamp_ns` column is prepended by this method right
         before sending. Any record buffered via `push()` is flushed first, so ordering is kept.
 
-        Note: Batch Size
-            Each call is transmitted as a single Flight message, and the server stores it as a
-            single chunk: the batch is not split nor merged with other batches. Its serialized
-            size must not exceed
-            [`MosaicoClient.max_batch_size_bytes`][mosaicolabs.comm.MosaicoClient.max_batch_size_bytes],
-            and batches close to that limit make the most efficient use of storage.
+        Note: Batch Sizing
+            The batch is sized against
+            [`MosaicoClient.max_batch_size_bytes`][mosaicolabs.comm.MosaicoClient.max_batch_size_bytes]
+            transparently for the caller:
+
+            - A batch larger than the limit is **split** into chunks under it, written
+              one after the other.
+            - Smaller batches are **buffered** and **merged**: consecutive ones are
+              concatenated into a single Flight message, as large as the limit allows,
+              so the server stores fewer (and larger) chunks. The buffered batches are
+              flushed before any record pushed via `push()` is flushed, and on close,
+              so records always reach the server in push order.
+
+            A single row whose size alone exceeds the limit cannot be split any
+            further: the whole batch is rejected with a `ValueError`.
 
         Note: Timestamp Ordering
             `timestamp_ns` must be non-decreasing, both within the batch and with respect to
@@ -415,7 +427,8 @@ class TopicWriter:
         Raises:
             ValueError: If `data` does not match the ontology schema, if `timestamp_ns` is not a
                 null-free, non-decreasing `int64` array as long as `data`, if its first value is
-                lower than the last timestamp written to the topic, or if the batch is too large.
+                lower than the last timestamp written to the topic, or if a single row of the batch
+                exceeds the maximum batch size (it cannot be split any further).
             Exception: If the transmission fails.
 
         Example:

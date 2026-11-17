@@ -55,7 +55,18 @@ class _TopicWriteState:
         flushing whenever adding the next record would exceed `max_batch_size_bytes`.
         A single record that alone exceeds `max_batch_size_bytes` cannot be split
         any further, so it is dropped instead - see `_push_by_bytes_size()`.
-    2.  **Sync Dispatch**.
+        `push_batch()` batches are accumulated in a separate Arrow-level buffer
+        (`_pending_arrow_batches`), merged into chunks as large as the limit allows:
+        they are concatenated on flush, so consecutive small batches travel as a
+        single Flight message instead of one message each.
+    2.  **Splitting**: a `push_batch()` batch whose serialized size exceeds
+        `max_batch_size_bytes` is sliced into chunks under the limit before being
+        written (see `_split_batch()`).
+    3.  **Sync Dispatch**.
+
+    The two buffers are flushed in push order: the Arrow-level buffer only holds
+    batches pushed after every buffered `Message`, so it is always flushed first
+    (see `_write_current_batch()`).
     """
 
     def __init__(
@@ -89,6 +100,14 @@ class _TopicWriteState:
         # --- Buffering State ---
         self._current_data_batch: List[Message] = []
         self._current_batch_size_bytes: int = 0
+
+        # --- Arrow-Level Buffering State (push_batch) ---
+        # Record batches, in wire format, buffered by `push_batch()` and merged
+        # into a single message on flush. Invariant: whenever the `Message` buffer
+        # is not empty, these batches are older than every buffered `Message`, so
+        # flushing them first (see `_write_current_batch()`) keeps push order.
+        self._pending_arrow_batches: List[pa.RecordBatch] = []
+        self._pending_arrow_batches_size: int = 0
 
         self._written_records = 0
         self._pushed_records = 0
@@ -222,14 +241,117 @@ class _TopicWriteState:
 
         return pushed
 
+    def _split_batch(self, batch: pa.RecordBatch) -> List[pa.RecordBatch]:
+        """
+        Slices an oversized `push_batch()` batch into chunks under the limit.
+
+        The largest prefix of rows that fits `max_batch_size_bytes` is found with a
+        binary search on the serialized size of the (zero-copy) row slices, then
+        repeated on the remaining rows: the serialized size of a row prefix is
+        non-decreasing in the number of rows, so the search is exact.
+
+        Args:
+            batch (pa.RecordBatch): The wire-format batch to slice, whose serialized
+                size exceeds `max_batch_size_bytes`.
+
+        Returns:
+            List[pa.RecordBatch]: The chunks, each under the limit, whose
+                concatenation is `batch`.
+
+        Raises:
+            ValueError: If a single row alone exceeds `max_batch_size_bytes`: it
+                cannot be split any further, so the whole batch is rejected.
+        """
+        chunks: List[pa.RecordBatch] = []
+        offset = 0
+        while offset < batch.num_rows:
+            remaining = batch.slice(offset)
+
+            if (
+                self._get_serialized_size(remaining.slice(0, 1))
+                > self.max_batch_size_bytes
+            ):
+                raise ValueError(
+                    f"Row {offset} of the batch cannot be sent: its size alone "
+                    f"exceeds the maximum batch size ({self.max_batch_size_bytes} "
+                    f"bytes) for topic '{self.topic_name}' and it cannot be split "
+                    "further."
+                )
+
+            # Largest prefix of the remaining rows that fits the limit
+            lo, hi = 1, remaining.num_rows
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if (
+                    self._get_serialized_size(remaining.slice(0, mid))
+                    <= self.max_batch_size_bytes
+                ):
+                    lo = mid
+                else:
+                    hi = mid - 1
+
+            chunks.append(remaining.slice(0, lo))
+            offset += lo
+
+        return chunks
+
+    def _write_arrow_batch(self, batch: pa.RecordBatch) -> None:
+        """
+        Writes a single wire-format batch to the Flight stream.
+
+        Args:
+            batch (pa.RecordBatch): The batch to write, already under
+                `max_batch_size_bytes`.
+
+        Raises:
+            Exception: If the transmission fails.
+        """
+        assert self.writer is not None
+
+        try:
+            self.writer.write(batch)
+        except Exception as e:
+            raise Exception(f"Write failed for topic '{self.topic_name}': '{e}'")
+
+        self._written_records += batch.num_rows
+
+    def _flush_arrow_batches(self) -> None:
+        """
+        Flushes the Arrow-level buffer of `push_batch()`, merging its batches.
+
+        The buffered batches are concatenated into a single wire-format batch
+        (their total size never exceeds `max_batch_size_bytes`, by construction),
+        so consecutive small batches are stored as a single chunk instead of one
+        chunk each.
+        """
+        assert self.writer is not None
+
+        if not self._pending_arrow_batches:
+            return
+
+        batches = self._pending_arrow_batches
+        self._pending_arrow_batches = []
+        self._pending_arrow_batches_size = 0
+
+        batch = batches[0] if len(batches) == 1 else pa.concat_batches(batches)
+        self._write_arrow_batch(batch)
+
     def push_batch(self, timestamp_ns: pa.Array, data: pa.RecordBatch):
         """
-        Sends a whole batch of records, bypassing the `Message` buffer.
+        Buffers a whole batch of records, bypassing the `Message` buffer.
 
         The `timestamp_ns` envelope column is prepended to the payload columns,
         producing a batch with the same wire schema used for buffered messages
-        (see `Message._get_schema`). Any buffered `Message` is flushed first, so
-        the records reach the server in the same order they were pushed.
+        (see `Message._get_schema`). The batch is then sized against
+        `max_batch_size_bytes`, transparently for the caller:
+
+        - An oversized batch is **split** into chunks under the limit, which are
+          written one after the other.
+        - A batch that fits is **buffered** and merged with the batches already
+          buffered by the previous `push_batch()` calls: on flush they are
+          concatenated into a single message, as large as the limit allows. The
+          buffer is flushed before any `push()` flush (so records keep reaching
+          the server in push order) and on close.
 
         Args:
             timestamp_ns (pa.Array): The `int64` timestamps in nanoseconds of the records,
@@ -240,7 +362,8 @@ class _TopicWriteState:
             ValueError: If the writer is None, if `data` does not match the ontology schema,
                 if `timestamp_ns` is not a null-free, non-decreasing `int64` array as long
                 as `data`, if its first value is lower than the last timestamp accepted on
-                this topic, or if the batch exceeds `max_batch_size_bytes`.
+                this topic, or if a single row of the batch exceeds `max_batch_size_bytes`
+                (it cannot be split any further).
         """
         if self.writer is None:
             raise ValueError("push_batch() called on uninitialized state.")
@@ -274,24 +397,37 @@ class _TopicWriteState:
         batch = pa.RecordBatch.from_arrays(
             [timestamp_ns, *data.columns], schema=self.wire_schema
         )
-
         batch_size = self._get_serialized_size(batch)
+
+        # Split an oversized batch before touching any buffer: a row that alone
+        # exceeds the limit rejects the whole batch without side effects.
+        chunks: Optional[List[pa.RecordBatch]] = None
         if batch_size > self.max_batch_size_bytes:
-            raise ValueError(
-                f"Batch size ({batch_size} bytes) exceeds the maximum batch size "
-                f"({self.max_batch_size_bytes} bytes) for topic '{self.topic_name}'."
-            )
+            chunks = self._split_batch(batch)
 
-        # Keep the records ordered with respect to the buffered messages
-        self._write_current_batch()
+        # Keep the records ordered with respect to the buffered messages: when
+        # the `Message` buffer is flushed, the (older) Arrow-level buffer is
+        # flushed with it.
+        if self._current_data_batch:
+            self._write_current_batch()
 
-        try:
-            self.writer.write(batch)
-        except Exception as e:
-            raise Exception(f"Write failed for topic '{self.topic_name}': '{e}'")
+        if chunks is not None:
+            # The buffered batches are older than the chunks: flush them first
+            self._flush_arrow_batches()
+            for chunk in chunks:
+                self._write_arrow_batch(chunk)
+        else:
+            # Merge: flush the buffered batches if adding this one would exceed
+            # the limit, then buffer it for a future merged flush
+            if (
+                self._pending_arrow_batches_size + batch_size
+                > self.max_batch_size_bytes
+            ):
+                self._flush_arrow_batches()
+            self._pending_arrow_batches.append(batch)
+            self._pending_arrow_batches_size += batch_size
 
         self._pushed_records += batch.num_rows
-        self._written_records += batch.num_rows
         if batch.num_rows > 0:
             self._last_timestamp_ns = timestamp_ns[-1].as_py()
 
@@ -326,6 +462,11 @@ class _TopicWriteState:
             raise ValueError("Writer is None")
 
         if self._current_data_batch:
+            # The Arrow-level buffer holds `push_batch()` batches that were pushed
+            # before these messages: flush it first, so the records reach the
+            # server in push order.
+            self._flush_arrow_batches()
+
             records = self._current_data_batch
 
             # Reset immediately
@@ -345,8 +486,11 @@ class _TopicWriteState:
         if self.writer is not None:
             try:
                 if not with_error:
-                    # Flush any data remaining in the buffer
+                    # Flush any data remaining in the buffers: the Arrow-level
+                    # batches first (they are older), then the `Message` buffer
+                    # (`_write_current_batch()` flushes both, in order)
                     self._write_current_batch()
+                    self._flush_arrow_batches()
 
                 self.writer.done_writing()
                 logger.info(
